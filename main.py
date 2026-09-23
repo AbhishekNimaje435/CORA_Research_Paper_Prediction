@@ -1,190 +1,192 @@
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.preprocessing.text import Tokenizer
-from tensorflow.keras.models import load_model
-
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-
-from contextlib import asynccontextmanager
-from pydantic import BaseModel, Field
-
+"""
+We are going to create our API now. 
+"""
+import os
 import numpy as np
-import pickle
-import re
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+import onnxruntime as ort
 
-"""
-1. We are going to make some constants like:
-A. Model Path (BiGRU)
-B. Tokenizer Path
-C. Max Sequence Length
-D. Emotion Labels
-E. Emotion emojis
-"""
-#A. Model Path (BiGRU)
-model_path = "Artifacts/BiGRU_Model.keras"
 
-#B. Tokenizer Path
-tokenizer_path = "Artifacts/tokenizer.pkl"
-
-#C. Max Sequence Length
-max_sequence_length = 50
-
-#D. Emotion Labels
-emotion_labels = ["sadness", "joy", "love", "anger", "fear", "surprise"]
-
-#E. Emotion emojis
-EMOTION_EMOJIS = {
-    "sadness": "😢",
-    "joy": "😄",
-    "love": "❤️",
-    "anger": "😠",
-    "fear": "😨",
-    "surprise": "😲",
+CORA_CLASSES = {
+    0: "Case_Based",
+    1: "Genetic_Algorithms",
+    2: "Neural_Networks",
+    3: "Probabilistic_Methods",
+    4: "Reinforcement_Learning",
+    5: "Rule_Learning",
+    6: "Theory",
 }
 
+BASE_DIR    = os.path.dirname(__file__)
+MODEL_PATH  = os.path.join(BASE_DIR, 'simple_gcn_cora.onnx')
+DATA_DIR    = os.path.join(BASE_DIR, "data", "Planetoid")
+STATIC_DIR  = os.path.join(BASE_DIR, "static")
+
+model_session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+
+app = FastAPI()
 
 
-"""
-2. Preprocess the upcoming text
-Cleans raw text so it matches the format used while training.
-A. Convert the text to lowercase. -done
-B. Remove apostrophes (e.g can't -> cant). -done
-C. Remove Special Characters and Punctuation. -done
-D. Remove extra spaces -done
-"""
-
-def preprocess_text(text: str)->str:
-    text = text.lower()
-    text = re.sub(r"'","",text)
-    text = re.sub(r"[^a-z0-9\s]"," ", text)
-    text = re.sub(r"\s+", " ",text).strip()
-    return text
+class GraphPredictRequest(BaseModel):
+    node_features: List[List[float]]
+    edge_indices: Optional[List[List[int]]] = None
 
 
-"""
-3. Request and Response Schemas
-A. Text Input -> Input schema the text sent by user. -done
-B. Prediciton Response -> Output schema the emotion to predict. -done
-C. Health Response (Server health check)
-"""
+class CoraNodeRequest(BaseModel):
+    node_indices: List[int]
 
-class TextInput(BaseModel):
-    text : str = Field(
-        ...,
-        min_length=1,
-        max_length=2000,
-        description="The sentence to analyze",
-        json_schema_extra={"example": "I feel so happy and excited"}
+
+def softmax(scores: np.ndarray):
+    shifted = scores - scores.max(axis=1, keepdims=True)
+    exp_scores = np.exp(shifted)
+    return exp_scores / exp_scores.sum(axis=-1, keepdims=True)
+
+
+def run_model(node_features: np.ndarray, edge_index: np.ndarray, node_indices_to_return):
+    try:
+        print("\n========== GCN DEBUG ==========")
+        print("Node features shape:", node_features.shape)
+        print("Node features dtype:", node_features.dtype)
+        print("Edge index shape:", edge_index.shape)
+        print("Edge index dtype:", edge_index.dtype)
+
+        print("\nONNX Inputs:")
+        for inp in model_session.get_inputs():
+            print("Name:", inp.name)
+            print("Shape:", inp.shape)
+            print("Type:", inp.type)
+
+        print("\nRunning ONNX inference...")
+
+        output = model_session.run(
+            ["logits"],
+            {
+                "node_features": node_features.astype(np.float32),
+                "edge_indices": edge_index.astype(np.int64)
+            },
         )
 
-class PredictionResponse(BaseModel):
-    text: str
-    predicted_emotion: str
-    confidence : float
-    all_probabilites: dict[str, float]
+        print("ONNX inference successful!")
+        print("Output shape:", output[0].shape)
 
-class HealthResponse(BaseModel):
-    status: str
-    model_loaded: bool
+        logits = output[0]
 
-"""
-4. Model Loading and LifeSpan Management
-Load the model and toknizer once the server starts up.
-"""
-dl_model = {} #{1. BiGRU, 2. Tokenizer}-> True , {} -> False
+        probabilites = softmax(logits)
+        predicted_classes = logits.argmax(axis=-1)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print('Loading the model and tokenizer...')
-    dl_model["BiGRU"] = load_model(model_path)                      #BiGRU Model
-    with open(tokenizer_path, 'rb') as file:
-        dl_model["Tokenizer"] = pickle.load(file)
-    print('Model are loaded successfully...')   
+        results = []
 
-    yield #Pause, model is laoded and server is running and at this point model wait karega for request
+        for i in node_indices_to_return:
+            results.append({
+                "node_index": i,
+                "predicted_class_id": int(predicted_classes[i]),
+                "predicted_class_name": CORA_CLASSES[int(predicted_classes[i])],
+                "probabilites": probabilites[i].tolist(),
+                "logits": logits[i].tolist(),
+            })
 
-    dl_model.clear() #Ek baar server band ho gaya uske baad model ko memory se hata do.
-               
+        return {
+            "num_nodes": node_features.shape[0],
+            "num_edges": edge_index.shape[1],
+            "predictions": results
+        }
 
-"""
-5. Mount the static files to the FastAPI app
-A. Enable CORS (Cross-Origin Resource Sharing) to allow requests from different origins.
-"""
-app = FastAPI(
-    lifespan=lifespan
-)
+    except Exception as error:
+        import traceback
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        print("\n========== GCN ERROR ==========")
+        traceback.print_exc()
 
-app.mount('/static', StaticFiles(directory="static"), name="static")
+        raise HTTPException(
+            status_code=500,
+            detail=f"GCN inference failed: {str(error)}"
+        )
+
+@app.get('/')
+def home_page():
+    index_file = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_file):
+        return FileResponse(index_file)
+    return {"service": "Simple GCN Cora API", "status": "Running"}
 
 
-
-"""
-6. API Endpoints.
-A. Server UI at homepage ('/')
-B. Health Check Endpoint ('/health')
-C. Predict Emotion Endpoint ('/predict')
-"""
-
-#A. Server UI at homepage ('/')
-@app.get('/', include_in_schema=False)
-def server_ui():
-    return FileResponse('static/index.html')
-
-#B. Health Check Endpoint ('/health')
-@app.get('/health', response_model=HealthResponse)
+@app.get("/health")
 def health_check():
-    return HealthResponse(status="Server is running", model_loaded=bool(dl_model))
+    return {"status": "healthy", "providers": model_session.get_providers()}
 
-#C. Predict Emotion Endpoint ('/predict')
-@app.post('/predict', response_model=PredictionResponse)
-def predict_emotion(text_input: TextInput):
-    """
-    1. Cleans the input sentences.
-    2. Convert the words into numeric using tokenizer.
-    3. Pad the sequences to ensure uniform length.
-    4. Run prediction using the BiGRU model.
-    5. Return the top emotion and full probability breakdown.
-    """
 
-    BiGRU_model     = dl_model.get("BiGRU")
-    tokenizer_model = dl_model.get("Tokenizer")
-
-    if BiGRU_model is None or tokenizer_model is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded yet. Please try again later.")
-
-    #1. 
-    cleaned_text = preprocess_text(text_input.text)
-
-    #2. and 3. 
-    tokenized_text = tokenizer_model.texts_to_sequences([cleaned_text])
-    padded_sequence = pad_sequences(
-        tokenized_text,
-        maxlen=max_sequence_length,
-        padding="post",
-        truncating="post"
-    )
-
-    probabilites     = BiGRU_model.predict(padded_sequence)[0]
-
-    top_emotion_index = int(np.argmax(probabilites)) # 4
-    all_probabilites =  {
-        label: float(prob) for prob, label in zip(probabilites, emotion_labels)
-          
+@app.get('/info')
+def model_info():
+    return {
+        "Model Name": "SimpeGCN",
+        "feature_dimension": 1433,
+        "num_classes": 7,
+        "class_mapping": CORA_CLASSES,
+        "inputs": [
+            {"name": inp.name, "shape": inp.shape, "type": inp.type}
+            for inp in model_session.get_inputs()
+        ],
+        "outputs": [
+            {"name": out.name, "shape": out.shape, "type": out.type}
+            for out in model_session.get_outputs()
+        ],
     }
 
-    return PredictionResponse(
-        text = text_input.text,
-        predicted_emotion = emotion_labels[top_emotion_index],
-        confidence = float(probabilites[top_emotion_index]), 
-        all_probabilites = all_probabilites
+
+@app.post("/predict")
+def predict_custom_graph(request: GraphPredictRequest):
+    if not request.node_features or request.node_features == 0:
+        raise HTTPException(400, "Node Features cannot be empty")
+
+    for feature_vector in request.node_features:
+        if len(feature_vector) != 1433:
+            raise HTTPException(422, "Each node's feature vector must exactly have 1433 features")
+
+    node_features = np.array(request.node_features, dtype=np.float32)
+    num_nodes = len(request.node_features)
+
+    if request.edge_indices:
+        edge_index = np.array(request.edge_indices, dtype=np.int64)
+        if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+            raise HTTPException(422, "edge_indices must have shape [2, num_edges]")
+    else:
+        node_ids = np.arange(num_nodes, dtype=np.int64)
+        edge_index = np.vstack([node_ids, node_ids])
+
+    all_node_features = list(range(num_nodes))
+    return run_model(node_features, edge_index, all_node_features)
+
+
+@app.post('/predict/cora_node')
+def predict_real_cora_nodes(request: CoraNodeRequest):
+    from torch_geometric.datasets import Planetoid
+    try:
+        cora_dataset = Planetoid(root=DATA_DIR, name="Cora")[0]
+    except Exception as error:
+        raise HTTPException(500, f"failed to load cora dataset: {error}")
+
+    largest_valid_index = cora_dataset.num_nodes - 1
+    invalid_index = [
+        i for i in request.node_indices
+        if i < 0 or i > largest_valid_index
+    ]
+    if invalid_index:
+        raise HTTPException(
+            400, f"node_index out of bound (must be 0 to {largest_valid_index})"
+        )
+
+    return run_model(
+        cora_dataset.x.numpy(),
+        cora_dataset.edge_index.numpy(),
+        request.node_indices
     )
+
+
+if os.path.isdir(STATIC_DIR):
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+
+
